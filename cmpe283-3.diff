@@ -1,0 +1,193 @@
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index c6ef2940119b..cfef48cf8779 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -54,6 +54,90 @@
+ #include "trace.h"
+ #include "pmu.h"
+ 
++//for reading cpu cycles
++//#include "rdtsc.h"
++
++//global variable declarations for vmx_exit stats
++
++#define MAX_MSG 80
++int print_count = 0; //counter for printing stats
++long long total_exit = 0; //counter for total exits
++long long total_cycle = 0; //counter for total amount of cycles spent processing all exits
++
++struct reason_info {
++	uint8_t bit;
++	const char *name;
++};
++
++struct reason_info list[65] =
++{
++	{0,"EXCEPTION_NMI"},
++	{1,"EXTERNAL_INTERRUPT"},
++	{2,"TRIPLE_FAULT"},
++	{3,""},
++	{4,""},
++	{5,""},
++	{6,""},
++	{7,"PENDING_INTERRUPT"},
++	{8,"NMI_WINDOW"},
++	{9,"TASK_SWITCH"},
++	{10,"CPUID"},
++	{11,""},
++	{12,"HLT"},
++	{13,"INVD"},
++	{14,"INVLPG"},
++	{15,"RDPMC"},
++	{16,"RDTSC"},
++	{17,""},
++	{18,"VMCALL"},
++	{19,"VMCLEAR"},
++	{20,"VMLAUNCH"},
++	{21,"VMPTRLD"},
++	{22,"VMPTRST"},
++	{23,"VMREAD"},
++	{24,"VMRESUME"},
++	{25,"VMWRITE"},
++	{26,"VMOFF"},
++	{27,"VMON"},
++	{28,"CR_ACCESS"},
++	{29,"DR_ACCESS"},
++	{30,"IO_INSTRUCTION"},
++	{31,"MSR_READ"},
++	{32,"MSR_WRITE"},
++	{33,"INVALID_STATE"},
++	{34,"MSR_LOAD_FAIL"},
++	{35,""},
++	{36,"MWAIT_INSTRUCTION"},
++	{37,"MONITOR_TRAP_FLAG"},
++	{38,""},
++	{39,"MONITOR_INSTRUCTION"},
++	{40,"PAUSE_INSTRUCTION"},
++	{41,"MCE_DURING_VMENTRY"},
++	{42,""},
++	{43,"TPR_BELOW_THRESHOLD"},
++	{44,"APIC_ACCESS"},
++	{45,"EOI_INDUCED"},
++	{46,"GDTR_IDTR"},
++	{47,"LDTR_TR"},
++	{48,"EPT_VIOLATION"},
++	{49,"EPT_MISCONFIG"},
++	{50,"INVEPT"},
++	{51,"RDTSCP"},
++	{52,"PREEMPTION_TIMER"},
++	{53,"INVVPID"},
++	{54,"WBINVD"},
++	{55,"XSETBV"},
++	{56,"APIC_WRITE"},
++	{57,"RDRAND"},
++	{58,"INVPCID"},
++	{59,"VMFUNC"},
++	{60,"ENCLS"},
++	{61,"RDSEED"},
++	{62,"PML_FULL"},
++	{63,"XSAVES"},
++	{64,"XRSTORS"}
++};
++
+ #define __ex(x) __kvm_handle_fault_on_reboot(x)
+ #define __ex_clear(x, reg) \
+ 	____kvm_handle_fault_on_reboot(x, "xor " reg " , " reg)
+@@ -7903,6 +7987,13 @@ static int (*const kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+ static const int kvm_vmx_max_exit_handlers =
+ 	ARRAY_SIZE(kvm_vmx_exit_handlers);
+ 
++//array for keeping track max,min,total of every exit
++
++long long exit_count[MAX_MSG] = {0};
++long long exit_max_cycle[MAX_MSG] = {0};
++long long exit_min_cycle[MAX_MSG] = {0};
++long long exit_total_cycle[MAX_MSG] = {0};
++
+ static bool nested_vmx_exit_handled_io(struct kvm_vcpu *vcpu,
+ 				       struct vmcs12 *vmcs12)
+ {
+@@ -8476,12 +8567,52 @@ static void dump_vmcs(void)
+ 		       vmcs_read16(VIRTUAL_PROCESSOR_ID));
+ }
+ 
++//printing stats
++void print_stats(void)
++{
++	int i;
++	char msg[MAX_MSG];
++	struct reason_info *r;
++	memset(msg, 0, sizeof(msg));
++
++	snprintf(msg,79,"\n\nNo\t         Exit Reason\tNo of exits\tMin Cycles\tMax Cycles\tAvg Cycles");
++	printk(msg);
++	for(i=0;i<kvm_vmx_max_exit_handlers;i++)
++	{
++		if(exit_total_cycle[i]>0)
++		{
++			r = &list[i];
++			snprintf(msg,79,"\n%2d\t%25s\t%lld\t\t%lld\t\t%lld\t\t%lld\t\t",
++				i,
++				r->name,
++				exit_count[i],
++				exit_min_cycle[i],
++				exit_max_cycle[i],
++				exit_total_cycle[i]/exit_count[i]);
++			printk(msg);
++		}
++	}
++	snprintf(msg,79,"\nTotal amount of cycles spent processing all exits: %lld",total_cycle);
++	printk(msg);
++	snprintf(msg,79,"\nTotal exits: %lld \n\n",total_exit);
++	printk(msg);
++}
++
+ /*
+  * The guest has exited.  See if we can fix it or if we need userspace
+  * assistance.
+  */
+ static int vmx_handle_exit(struct kvm_vcpu *vcpu)
+ {
++	long start=0,end=0;
++	//printing stats of vmx_exits
++	if(print_count == 500)
++	{
++		print_stats();
++		print_count = 0;
++	}
++	print_count++;
++
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ 	u32 exit_reason = vmx->exit_reason;
+ 	u32 vectoring_info = vmx->idt_vectoring_info;
+@@ -8549,7 +8680,29 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu)
+ 
+ 	if (exit_reason < kvm_vmx_max_exit_handlers
+ 	    && kvm_vmx_exit_handlers[exit_reason])
+-		return kvm_vmx_exit_handlers[exit_reason](vcpu);
++	{
++		int c;
++		long dif;
++		total_exit++;
++		exit_count[exit_reason]++;
++		start = rdtsc();
++		c = kvm_vmx_exit_handlers[exit_reason](vcpu);
++		end = rdtsc();
++		dif = end - start;
++		exit_total_cycle[exit_reason] += dif;
++		if(exit_max_cycle[exit_reason]<dif)
++		{
++			exit_max_cycle[exit_reason] = dif;
++		}
++		else{
++			if(exit_min_cycle[exit_reason]>dif || exit_min_cycle[exit_reason]==0)
++			{
++				exit_min_cycle[exit_reason] = dif;
++			}
++		}
++		total_cycle += dif;
++		return c;
++	}
+ 	else {
+ 		vcpu_unimpl(vcpu, "vmx: unexpected exit reason 0x%x\n",
+ 				exit_reason);
